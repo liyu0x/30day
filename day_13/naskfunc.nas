@@ -6,7 +6,6 @@
 [BITS 32]                       ; 制作32位模式用的机器语言
 
 ; 制作目标文件的信息
-
 [FILE "naskfunc.nas"]           ; 源文件名信息
         GLOBAL	_io_hlt, _io_cli, _io_sti, _io_stihlt           ; 程序中包含的函数名
 	GLOBAL	_io_in8,  _io_in16,  _io_in32
@@ -47,7 +46,7 @@ _io_stihlt:     ; void io_stihlt(void);
 _io_in8:        ; int io_in8(int port);
         MOV     EDX,[ESP+4]     ; port
         MOV     EAX,0
-        IN      AX,DX
+        IN      AL,DX
         RET
 
 _io_in16:       ; int io_in16(int port);
@@ -88,13 +87,6 @@ _io_store_eflags:	; void io_store_eflags(int eflags);
         MOV	EAX,[ESP+4]
         PUSH	EAX
         POPFD		; 指 POP EFLAGS
-        RET
-
-
-_write_mem8:            ; viod write_mem8(int addr, int data);
-        MOV     ECX, [ESP+4]    ; [ESP+4]中存放的是地址,将其读入ECX
-        MOV     AL, [ESP+8]     ; [ESP+8]中存放的是数据,将其读入AL
-        MOV     [ECX], AL
         RET
 
 
