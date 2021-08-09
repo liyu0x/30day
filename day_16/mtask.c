@@ -3,6 +3,74 @@
 struct TASKCTL *taskctl;
 struct TIMER *task_timer;
 
+struct TASK *task_now(void)
+// 返回当前活动的TASK地址
+{
+    struct TASKLEVEL *tl = &taskctl->level[taskctl->now_lv];
+    return tl->tasks[tl->now];
+}
+
+void task_add(struct TASK *task)
+// 向TASK_LEVEL结构体中添加任务
+{
+    struct TASKLEVEL *tl = &taskctl->level[task->level];
+    tl->tasks[tl->running] = task;
+    tl->running++;
+    task->flags = 2; /* 活动中 */
+    return;
+}
+
+void task_remove(struct TASK *task)
+{
+    int i;
+    struct TASKLEVEL *tl = &taskctl->level[task->level];
+
+    /* 查找task在数组中的索引*/
+    for (i = 0; i < tl->running; i++)
+    {
+        if (tl->tasks[i] == task)
+        {
+            break;
+        }
+    }
+
+    tl->running--;
+    if (i < tl->now)
+    {
+        tl->now--; /* 如果不是当前正在执行的任务,则now-- */
+    }
+    if (tl->now >= tl->running)
+    {
+        /* 修正now */
+        tl->now = 0;
+    }
+    task->flags = 1; /* 休眠中 */
+
+    /* 调整数组位置 */
+    for (; i < tl->running; i++)
+    {
+        tl->tasks[i] = tl->tasks[i + 1];
+    }
+
+    return;
+}
+
+void task_switchsub(void)
+{
+    int i;
+    //优先执行最上层的任务
+    for (i = 0; i < MAX_TASKLEVELS; i++)
+    {
+        if (taskctl->level[i].running > 0)
+        {
+            break;
+        }
+    }
+    taskctl->now_lv = i;
+    taskctl->lv_change = 0;
+    return;
+}
+
 struct TASK *task_init(struct MEMMAN *memman)
 {
     int i;
@@ -15,12 +83,17 @@ struct TASK *task_init(struct MEMMAN *memman)
         taskctl->tasks0[i].sel = (TASK_GDT0 + i) * 8;
         set_segmdesc(gdt + TASK_GDT0 + i, 103, (int)&taskctl->tasks0[i].tss, AR_TSS32);
     }
+    for (i = 0; i < MAX_TASKLEVELS; i++)
+    {
+        taskctl->level[i].running = 0;
+        taskctl->level[i].now = 0;
+    }
     task = task_alloc();
     task->flags = 2;    /* 活动中的标志 */
-    task->priority = 2; // 0.02秒
-    taskctl->running = 1;
-    taskctl->now = 0;
-    taskctl->tasks[0] = task;
+    task->priority = 2; /* 0.02秒 */
+    task->level = 0;    /* 最高LEVEL */
+    task_add(task);
+    task_switchsub(); /* LEVEL设置 */
     load_tr(task->sel);
     task_timer = timer_alloc();
     timer_settime(task_timer, task->priority);
@@ -57,77 +130,70 @@ struct TASK *task_alloc(void)
     return 0; /* 全部正在使用 */
 }
 
-void task_run(struct TASK *task, int priority)
+void task_run(struct TASK *task, int level, int priority)
 {
+    if (level < 0)
+    {
+        level = task->level; /* 不改变LEVEL */
+    }
     if (priority > 0)
     {
-        task->priority = priority;
+        task->priority = priority; /* 不改变优先级 */
+    }
+
+    // 改变活动中的level
+    if (task->flags == 2 && task->level != level)
+    {
+        task_remove(task); /* 这里执行后flag变为1 */
     }
     if (task->flags != 2)
     {
-        task->flags = 2; /* 活动中的标志 */
-        taskctl->tasks[taskctl->running] = task;
-        taskctl->running++;
+        /* 从休眠状态唤醒 */
+        task->level = level;
+        task_add(task);
+    }
+
+    taskctl->lv_change = 1; /* 下次切换任务时检查LEVEL */
+    return;
+}
+
+void task_sleep(struct TASK *task)
+{
+    struct TASK *now_task;
+    if (task->flags == 2)
+    { //活动状态
+        now_task = task_now();
+        task_remove(task); // flag变为1
+        if (task == now_task)
+        {
+            /* 切换到应该执行的任务 */
+            task_switchsub();
+            now_task = task_now(); /* 跳转到该执行的任务 */
+            farjmp(0, now_task->sel);
+        }
     }
     return;
 }
 
 void task_switch(void)
 {
-    struct TASK *task;
-    taskctl->now++;
-    if (taskctl->now == taskctl->running)
+    struct TASKLEVEL *tl = &taskctl->level[taskctl->now_lv];
+    struct TASK *new_task, *now_task = tl->tasks[tl->now];
+    tl->now++;
+    if (tl->now == tl->running)
     {
-        taskctl->now = 0;
+        tl->now = 0;
     }
-    task = taskctl->tasks[taskctl->now];
-    timer_settime(task_timer, task->priority);
-    if (taskctl->running >= 2)
+    if (taskctl->lv_change != 0)
     {
-        farjmp(0, task->sel);
+        task_switchsub();
+        tl = &taskctl->level[taskctl->now_lv];
     }
-    return;
-}
-
-void task_sleep(struct TASK *task)
-{
-    int i;
-    char ts = 0;
-    if (task->flags == 2)
-    { /* 如果指定任务处于唤醒状态 */
-        if (task == taskctl->tasks[taskctl->now])
-        {
-            ts = 1; /* 让自己休眠的话, 稍后需要进行任务切换 */
-        }
-        /* 寻找task所在的位置 */
-        for (i = 0; i < taskctl->running; i++)
-        {
-            if (taskctl->tasks[i] == task)
-            {
-                break;
-            }
-        }
-        taskctl->running--;
-        if (i < taskctl->now)
-        {
-            taskctl->now--; /* 需要移动成员, 要相应的处理 */
-        }
-        /* 移动成员 */
-        for (; i < taskctl->running; i++)
-        {
-            taskctl->tasks[i] = taskctl->tasks[i + 1];
-        }
-        task->flags = 1; /* 不工作的状态 */
-        if (ts != 0)
-        {
-            /* 任务切换 */
-            if (taskctl->now >= taskctl->running)
-            {
-                /* 如果now的值出现异常，则进行修正 */
-                taskctl->now = 0;
-            }
-            farjmp(0, taskctl->tasks[taskctl->now]->sel);
-        }
+    new_task = tl->tasks[tl->now];
+    timer_settime(task_timer, new_task->priority);
+    if (new_task != now_task)
+    {
+        farjmp(0, new_task->sel);
     }
     return;
 }
