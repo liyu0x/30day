@@ -213,7 +213,7 @@ void HariMain(void)
 						fifo32_put(&task_cons->fifo, s[0] + 256);
 					}
 				}
-				if (i == 256 + 0x0e && cursor_x > 8)
+				if (i == 256 + 0x0e)
 				{ /* 退格键 */
 					if (key_to == 0)
 					{ /* 发给任务A */
