@@ -5,15 +5,34 @@
 void console_task(struct SHEET *sheet, int memtotal)
 {
     struct TASK *task = task_now();
+    struct FILEHANDLE fhandle[8];
     struct MEMMAN *memman = (struct MEMMAN *)MEMMAN_ADDR;
     int i, *fat = (int *)memman_alloc_4k(memman, 4 * 2880);
     struct CONSOLE cons;
     char cmdline[30];
+    unsigned char *nihongo = (char *)*((int *)0x0fe8);
     cons.sht = sheet;
     cons.cur_x = 8;
     cons.cur_y = 28;
     cons.cur_c = -1;
     task->cons = &cons;
+    task->cmdline = cmdline;
+    task->fhandle = fhandle;
+    task->fat = fat;
+
+    for (i = 0; i < 8; i++)
+    {
+        fhandle[i].buf = 0; // 未使用标记
+    }
+    if (nihongo[4096] != 0xff)
+    {
+        task->langmode = 1;
+    }
+    else
+    {
+        task->langmode = 0;
+    }
+    task->langbyte1 = 0;
 
     if (cons.sht != 0)
     {
@@ -179,6 +198,7 @@ void cons_newline(struct CONSOLE *cons)
 {
     int x, y;
     struct SHEET *sheet = cons->sht;
+    struct TASK *task = task_now();
     if (cons->cur_y < 28 + 112)
     {
         cons->cur_y += 16; /* 到下一行 */
@@ -206,6 +226,10 @@ void cons_newline(struct CONSOLE *cons)
         }
     }
     cons->cur_x = 8;
+    if (task->langmode == 1 && task->langbyte1 != 0)
+    {
+        cons->cur_x += 8;
+    }
     return;
 }
 
@@ -242,10 +266,6 @@ void cons_runcmd(char *cmdline, struct CONSOLE *cons, int *fat, int memtotal)
     {
         cmd_dir(cons);
     }
-    else if (strncmp(cmdline, "type ", 5) == 0 && cons->sht != 0)
-    {
-        cmd_type(cons, fat, cmdline);
-    }
     else if (strcmp(cmdline, "exit") == 0)
     {
         cmd_exit(cons, fat);
@@ -257,6 +277,10 @@ void cons_runcmd(char *cmdline, struct CONSOLE *cons, int *fat, int memtotal)
     else if (strncmp(cmdline, "ncst ", 5) == 0)
     {
         cmd_ncst(cons, cmdline, memtotal);
+    }
+    else if (strncmp(cmdline, "langmode ", 9) == 0)
+    {
+        cmd_langmode(cons, cmdline);
     }
     else if (cmdline[0] != 0)
     {
@@ -275,6 +299,22 @@ void cmd_mem(struct CONSOLE *cons, int memtotal)
     char s[60];
     sprintf(s, "total   %dMB\nfree %dKB\n\n", memtotal / (1024 * 1024), memman_total(memman) / 1024);
     cons_putstr0(cons, s);
+    return;
+}
+
+void cmd_langmode(struct CONSOLE *cons, char *cmdline)
+{
+    struct TASK *task = task_now();
+    unsigned char mode = cmdline[9] - '0';
+    if (mode <= 1)
+    {
+        task->langmode = mode;
+    }
+    else
+    {
+        cons_putstr0(cons, "mode number error.\n");
+    }
+    cons_newline(cons);
     return;
 }
 
@@ -320,28 +360,6 @@ void cmd_dir(struct CONSOLE *cons)
                 cons_putstr0(cons, s);
             }
         }
-    }
-    cons_newline(cons);
-    return;
-}
-
-void cmd_type(struct CONSOLE *cons, int *fat, char *cmdline)
-{
-    struct MEMMAN *memman = (struct MEMMAN *)MEMMAN_ADDR;
-    struct FILEINFO *finfo = file_search(cmdline + 5, (struct FILEINFO *)(ADR_DISKIMG + 0x002600), 224);
-    char *p;
-    if (finfo != 0)
-    {
-        /* 找到文件的情况 */
-        p = (char *)memman_alloc_4k(memman, finfo->size);
-        file_loadfile(finfo->clustno, finfo->size, p, fat, (char *)(ADR_DISKIMG + 0x003e00));
-        cons_putstr1(cons, p, finfo->size);
-        memman_free_4k(memman, (int)p, finfo->size);
-    }
-    else
-    {
-        /* 没有找到的情况 */
-        cons_putstr0(cons, "File not found.\n");
     }
     cons_newline(cons);
     return;
@@ -438,6 +456,7 @@ int cmd_app(struct CONSOLE *cons, int *fat, char *cmdline)
             }
             timer_cancelall(&task->fifo);
             memman_free_4k(memman, (int)q, segsiz);
+            task->langbyte1 = 0;
         }
         else
         {
@@ -498,6 +517,9 @@ int *hrb_api(int edi, int esi, int ebp, int esp, int ebx, int edx, int ecx, int 
     /* reg[4] : EBX,   reg[5] : EDX,   reg[6] : ECX,   reg[7] : EAX */
     int i;
     struct FIFO32 *sys_fifo = (struct FIFO32 *)*((int *)0x0fec);
+    struct FILEINFO *finfo;
+    struct FILEHANDLE *fh;
+    struct MEMMAN *memman = (struct MEMMAN *)MEMMAN_ADDR;
 
     if (edx == 1)
     {
@@ -809,6 +831,154 @@ int *hrb_api(int edi, int esi, int ebp, int esp, int ebx, int edx, int ecx, int 
             i = io_in8(0x61);
             io_out8(0x61, (i | 0x03) & 0x0f);
         }
+    }
+    else if (edx == 21)
+    {
+        /**
+         * 打开文件
+         * EDX=21
+         * EBX=文件名
+         * EAX=文件句柄（为0时表示打开失败）（由操作系统返回）
+         **/
+        for (i = 0; i < 8; i++)
+        {
+            if (task->fhandle[i].buf == 0)
+            {
+                break;
+            }
+        }
+        fh = &task->fhandle[i];
+        reg[7] = 0;
+        if (i < 8)
+        {
+            finfo = file_search((char *)ebx + ds_base, (struct FILEINFO *)(ADR_DISKIMG + 0x002600), 224);
+            if (finfo != 0)
+            {
+                reg[7] = (int)fh;
+                fh->buf = (char *)memman_alloc_4k(memman, finfo->size);
+                fh->size = finfo->size;
+                fh->pos = 0;
+                file_loadfile(finfo->clustno, finfo->size, fh->buf, task->fat, (char *)(ADR_DISKIMG + 0x003e00));
+            }
+        }
+    }
+    else if (edx == 22)
+    {
+        /**
+         * 关闭文件
+         * EDX=22
+         * EAX=文件句柄
+         **/
+        fh = (struct FILEHANDLE *)eax;
+        memman_free_4k(memman, (int)fh->buf, fh->size);
+        fh->buf = 0;
+    }
+    else if (edx == 23)
+    {
+        /**
+         * 文件定位
+         * EDX=23
+         * EAX=文件句柄
+         * ECX=定位模式
+         *      =0：定位的起点为文件开头
+         *      =1：定位的起点为当前的访问位置
+         *      =2：定位的起点为文件末尾
+         * EBX=定位偏移量获取文件大小
+         **/
+        fh = (struct FILEHANDLE *)eax;
+        if (ecx == 0)
+        {
+            fh->pos = ebx;
+        }
+        else if (ecx == 1)
+        {
+            fh->pos += ebx;
+        }
+        else if (ecx == 2)
+        {
+            fh->pos = fh->size + ebx;
+        }
+        if (fh->pos < 0)
+        {
+            fh->pos = 0;
+        }
+        if (fh->pos > fh->size)
+        {
+            fh->pos = fh->size;
+        }
+    }
+    else if (edx == 24)
+    {
+        /**
+         * 获取文件大小
+         * EDX=24
+         * EAX=文件句柄
+         * ECX=文件大小获取模式
+         *      =0：普通文件大小
+         *      =1：当前读取位置从文件开头起算的偏移量
+         *      =2：当前读取位置从文件末尾起算的偏移量
+         * EAX=文件大小（由操作系统返回）
+         **/
+        fh = (struct FILEHANDLE *)eax;
+        if (ecx == 0)
+        {
+            reg[7] = fh->size;
+        }
+        else if (ecx == 1)
+        {
+            reg[7] = fh->pos;
+        }
+        else if (ecx == 2)
+        {
+            reg[7] = fh->pos - fh->size;
+        }
+    }
+    else if (edx == 25)
+    {
+        /**
+         * 文件读取
+         * EDX=25
+         * EAX=文件句柄
+         * EBX=缓冲区地址
+         * ECX=最大读取字节数
+         * EAX=本次读取到的字节数（由操作系统返回）
+         **/
+        fh = (struct FILEHANDLE *)eax;
+        for (i = 0; i < ecx; i++)
+        {
+            if (fh->pos == fh->size)
+            {
+                break;
+            }
+            *((char *)ebx + ds_base + i) = fh->buf[fh->pos];
+            fh->pos++;
+        }
+        reg[7] = i;
+    }
+    else if (edx == 26)
+    {
+        /**
+         * 获取命令行
+         * EDX=26
+         * EBX=存放命令行内容的地址
+         * ECX=最多可存放多少字节
+         * EAX=实际存放了多少字节（由操作系统返回）
+         **/
+        i = 0;
+        for (;;)
+        {
+            *((char *)ebx + ds_base + i) = task->cmdline[i];
+            if (task->cmdline[i] == 0)
+            {
+                break;
+            }
+            if (i >= ecx)
+            {
+                break;
+            }
+            i++;
+        }
+        reg[7] = i;
     }
     return 0;
 }
